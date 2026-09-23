@@ -7,7 +7,10 @@ authors = [
     { name = "imiderji", email = "skishou.developer@yandex.ru" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.9,<3.14",
+]
 
 [project.scripts]
 itg-crawler = "itg_crawler:main"
@@ -18,6 +21,7 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 79
@@ -31,7 +35,9 @@ known-first-party = ["itg_crawler"]
 
 [dependency-groups]
 dev = [
+    "aioresponses>=0.7.9",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.16.8",
     "ty>=0.0.83",
 ]
