@@ -3,6 +3,8 @@ import logging
 
 import aiohttp
 
+from itg_crawler.parser import HTMLParser
+
 logger = logging.getLogger(__name__)
 
 
@@ -10,6 +12,7 @@ class AsyncCrawler:
     def __init__(self, max_concurrent: int = 10) -> None:
         self.max_concurrent = max_concurrent
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.parser = HTMLParser()
         self._session: aiohttp.ClientSession | None = None
         self._timeout = aiohttp.ClientTimeout(connect=10, sock_read=10)
 
@@ -45,6 +48,19 @@ class AsyncCrawler:
         tasks = [self.fetch_url(url) for url in urls]
         results = await asyncio.gather(*tasks)
         return dict(zip(urls, results, strict=True))
+
+    async def fetch_and_parse(self, url: str) -> dict:
+        html = await self.fetch_url(url)
+
+        if not html:
+            return {
+                "url": url,
+                "title": "",
+                "text": "",
+                "links": [],
+                "metadata": {},
+            }
+        return await self.parser.parse_html(html, url)
 
     async def close(self) -> None:
         if self._session is not None:
