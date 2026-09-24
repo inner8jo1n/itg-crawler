@@ -7,39 +7,97 @@ import aiohttp
 
 from itg_crawler.parser import HTMLParser
 from itg_crawler.queue import CrawlerQueue
+from itg_crawler.rate_limiter import RateLimiter
+from itg_crawler.robots_parser import RobotsParser
 from itg_crawler.semaphore_manager import SemaphoreManager
 
 logger = logging.getLogger(__name__)
 
 
 class AsyncCrawler:
-    def __init__(self, max_concurrent: int = 10, max_depth: int = 3) -> None:
+    def __init__(
+        self,
+        max_concurrent: int = 10,
+        max_depth: int = 3,
+        requests_per_second: float = 1.0,
+        respect_robots: bool = True,
+        min_delay: float = 0.0,
+        jitter: float = 0.0,
+        user_agent: str = "AsyncCrawler/1.0",
+        user_agents: list[str] | None = None,
+    ) -> None:
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
+        self.respect_robots = respect_robots
+        self.user_agent = user_agent
+        self.user_agents = user_agents
+        self._user_agent_index = 0
+        self._blocked_count = 0
         self.parser = HTMLParser()
         self.queue = CrawlerQueue()
         self.semaphore_manager = SemaphoreManager(
             max_concurrent=max_concurrent
         )
+        self.rate_limiter = RateLimiter(
+            requests_per_second=requests_per_second,
+            min_delay=min_delay,
+            jitter=jitter,
+        )
+        self.robots_parser = RobotsParser()
         self._session: aiohttp.ClientSession | None = None
         self._timeout = aiohttp.ClientTimeout(connect=10, sock_read=10)
 
+    def _get_user_agent(self) -> str:
+        if not self.user_agents:
+            return self.user_agent
+
+        agent = self.user_agents[
+            self._user_agent_index % len(self.user_agents)
+        ]
+        self._user_agent_index += 1
+        return agent
+
+    def get_rate_stats(self) -> dict:
+        rate_limiter_stats = self.rate_limiter.get_stats()
+        return {
+            "requests_per_second": rate_limiter_stats["requests_per_second"],
+            "avg_delay": rate_limiter_stats["avg_delay"],
+            "blocked_by_robots": self._blocked_count,
+        }
+
     async def fetch_url(self, url: str) -> str:
         session = await self._get_session()
+        domain = urlparse(url).netloc
+        user_agent = self._get_user_agent()
+
+        if self.respect_robots:
+            await self.robots_parser.fetch_robots(url)
+            if not self.robots_parser.can_fetch(url, user_agent=user_agent):
+                self._blocked_count += 1
+                logger.warning("Blocked by robots.txt: %s", url)
+                return ""
+
+            crawl_delay = self.robots_parser.get_crawl_delay(
+                url, user_agent=user_agent
+            )
+            if crawl_delay > 0:
+                self.rate_limiter.set_domain_delay(domain, crawl_delay)
 
         logger.info("Fetching URL: %s", url)
         try:
-            async with (
-                self.semaphore_manager.acquire(url),
-                session.get(url) as response,
-            ):
-                response.raise_for_status()
-                text = await response.text()
-                logger.info(
-                    "Fetched URL: %s with status %d", url, response.status
-                )
-                return text
+            async with self.semaphore_manager.acquire(url):
+                await self.rate_limiter.acquire(domain=domain)
+                headers = {"User-Agent": user_agent}
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    text = await response.text()
+                    logger.info(
+                        "Fetched URL: %s with status %d", url, response.status
+                    )
+                    self.rate_limiter.record_success(domain)
+                    return text
         except aiohttp.ClientResponseError as client_response_error:
+            self.rate_limiter.record_failure(domain)
             logger.error(
                 "Failed to fetch URL: %s with status %d",
                 url,
@@ -47,9 +105,11 @@ class AsyncCrawler:
             )
             return ""
         except TimeoutError:
+            self.rate_limiter.record_failure(domain)
             logger.error("Timeout while fetching URL: %s", url)
             return ""
         except aiohttp.ClientError as client_error:
+            self.rate_limiter.record_failure(domain)
             logger.error(
                 "Failed to fetch URL: %s due to %s", url, client_error
             )
@@ -138,6 +198,14 @@ class AsyncCrawler:
                     stats["failed"],
                     rate,
                 )
+                rate_stats = self.get_rate_stats()
+                logger.info(
+                    "Requests/sec: %.2f | Avg delay: %.2fs | "
+                    "Blocked by robots: %d",
+                    rate_stats["requests_per_second"],
+                    rate_stats["avg_delay"],
+                    rate_stats["blocked_by_robots"],
+                )
 
         workers = [
             asyncio.create_task(worker()) for _ in range(self.max_concurrent)
@@ -150,6 +218,7 @@ class AsyncCrawler:
         if self._session is not None:
             await self._session.close()
             self._session = None
+        await self.robots_parser.close()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:

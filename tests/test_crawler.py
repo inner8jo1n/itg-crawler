@@ -66,7 +66,7 @@ async def test_parallel_is_faster_than_sequential():
         for url in urls:
             mocked.get(url, callback=slow_response, repeat=True)
 
-        crawler = AsyncCrawler()
+        crawler = AsyncCrawler(requests_per_second=1000.0)
 
         start = time.perf_counter()
         for url in urls:
@@ -81,3 +81,23 @@ async def test_parallel_is_faster_than_sequential():
 
         assert len(results) == len(urls)
         assert parallel_time < sequential_time
+
+
+async def test_fetch_url_respects_robots_disallow():
+    robots_txt = "User-agent: *\nDisallow: /private/\n"
+
+    with aioresponses() as mocked:
+        mocked.get(
+            "https://example.com/robots.txt", status=200, body=robots_txt
+        )
+        mocked.get(
+            "https://example.com/private/secret",
+            status=200,
+            body="Should never be fetched",
+        )
+
+        crawler = AsyncCrawler(respect_robots=True)
+        result = await crawler.fetch_url("https://example.com/private/secret")
+        await crawler.close()
+
+        assert result == ""
