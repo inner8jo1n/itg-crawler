@@ -2,6 +2,8 @@ import asyncio
 import logging
 import time
 from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import aiohttp
@@ -21,8 +23,16 @@ from itg_crawler.rate_limiter import RateLimiter
 from itg_crawler.retry import RetryStrategy
 from itg_crawler.robots_parser import RobotsParser
 from itg_crawler.semaphore_manager import SemaphoreManager
+from itg_crawler.storage import DataStorage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FetchResponse:
+    text: str
+    status_code: int | None = None
+    content_type: str | None = None
 
 
 class AsyncCrawler:
@@ -40,6 +50,7 @@ class AsyncCrawler:
         read_timeout: float = 10.0,
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        storage: DataStorage | None = None,
     ) -> None:
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -66,6 +77,7 @@ class AsyncCrawler:
             overrides={ServerError: {"max_retries": 1}},
         )
         self.circuit_breaker = circuit_breaker
+        self.storage = storage
         self._session: aiohttp.ClientSession | None = None
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
@@ -98,6 +110,10 @@ class AsyncCrawler:
         return stats
 
     async def fetch_url(self, url: str) -> str:
+        response = await self._fetch_with_retry(url)
+        return response.text
+
+    async def _fetch_with_retry(self, url: str) -> FetchResponse:
         domain = urlparse(url).netloc
         user_agent = self._get_user_agent()
 
@@ -106,7 +122,7 @@ class AsyncCrawler:
             if not self.robots_parser.can_fetch(url, user_agent=user_agent):
                 self._blocked_count += 1
                 logger.warning("Blocked by robots.txt: %s", url)
-                return ""
+                return FetchResponse(text="")
 
             crawl_delay = self.robots_parser.get_crawl_delay(
                 url, user_agent=user_agent
@@ -118,11 +134,11 @@ class AsyncCrawler:
             domain
         ):
             logger.warning("Circuit breaker open for domain: %s", domain)
-            return ""
+            return FetchResponse(text="")
 
         attempt_state = {"count": 0}
 
-        async def attempt() -> str:
+        async def attempt() -> FetchResponse:
             attempt_state["count"] += 1
             multiplier = 1.0 + 0.5 * (attempt_state["count"] - 1)
             return await self._fetch_once(
@@ -131,7 +147,7 @@ class AsyncCrawler:
 
         logger.info("Fetching URL: %s", url)
         try:
-            text = await self.retry_strategy.execute_with_retry(attempt)
+            response = await self.retry_strategy.execute_with_retry(attempt)
         except CrawlerError as error:
             logger.error(
                 "Failed to fetch URL: %s (%s)", url, type(error).__name__
@@ -139,12 +155,12 @@ class AsyncCrawler:
             self.rate_limiter.record_failure(domain)
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure(domain)
-            return ""
+            return FetchResponse(text="", status_code=error.status_code)
 
         self.rate_limiter.record_success(domain)
         if self.circuit_breaker:
             self.circuit_breaker.record_success(domain)
-        return text
+        return response
 
     async def _fetch_once(
         self,
@@ -152,7 +168,7 @@ class AsyncCrawler:
         domain: str,
         user_agent: str,
         timeout_multiplier: float = 1.0,
-    ) -> str:
+    ) -> FetchResponse:
         session = await self._get_session()
         timeout = None
         if timeout_multiplier != 1.0:
@@ -173,7 +189,12 @@ class AsyncCrawler:
                     logger.info(
                         "Fetched URL: %s with status %d", url, response.status
                     )
-                    return text
+                    content_type = response.headers.get("Content-Type", "")
+                    return FetchResponse(
+                        text=text,
+                        status_code=response.status,
+                        content_type=content_type.split(";")[0].strip(),
+                    )
         except aiohttp.ClientResponseError as client_response_error:
             logger.error(
                 "Failed to fetch URL: %s with status %d",
@@ -208,10 +229,10 @@ class AsyncCrawler:
         return dict(zip(urls, results, strict=True))
 
     async def fetch_and_parse(self, url: str) -> dict:
-        html = await self.fetch_url(url)
+        response = await self._fetch_with_retry(url)
 
-        if not html:
-            return {
+        if not response.text:
+            result = {
                 "url": url,
                 "title": "",
                 "text": "",
@@ -219,7 +240,38 @@ class AsyncCrawler:
                 "metadata": {},
                 "images": [],
             }
-        return await self.parser.parse_html(html, url)
+        else:
+            result = await self.parser.parse_html(response.text, url)
+
+        result["crawled_at"] = datetime.now(UTC)
+        result["status_code"] = response.status_code
+        result["content_type"] = response.content_type
+        return result
+
+    async def _save_result(self, result: dict, max_attempts: int = 3) -> None:
+        if self.storage is None:
+            return
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self.storage.save(result)
+                return
+            except Exception as error:
+                logger.error(
+                    "Failed to save %s (attempt %d/%d): %s",
+                    result.get("url"),
+                    attempt,
+                    max_attempts,
+                    error,
+                )
+                if attempt == max_attempts:
+                    logger.error(
+                        "Giving up saving %s after %d attempt(s)",
+                        result.get("url"),
+                        max_attempts,
+                    )
+                    return
+                await asyncio.sleep(0.5 * attempt)
 
     async def crawl(
         self,
@@ -270,6 +322,7 @@ class AsyncCrawler:
                     if result["title"] or result["text"] or result["links"]:
                         self.queue.mark_processed(url, result)
                         results.append(result)
+                        await self._save_result(result)
 
                         depth = self.queue.get_depth(url)
                         if depth < self.max_depth:
@@ -351,6 +404,8 @@ class AsyncCrawler:
             await self._session.close()
             self._session = None
         await self.robots_parser.close()
+        if self.storage is not None:
+            await self.storage.close()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
