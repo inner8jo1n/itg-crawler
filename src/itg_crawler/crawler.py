@@ -1,13 +1,24 @@
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from urllib.parse import urlparse
 
 import aiohttp
 
+from itg_crawler.circuit_breaker import CircuitBreaker
+from itg_crawler.errors import (
+    CrawlerError,
+    NetworkError,
+    RateLimitedError,
+    ServerError,
+    TransientError,
+    classify_http_status,
+)
 from itg_crawler.parser import HTMLParser
 from itg_crawler.queue import CrawlerQueue
 from itg_crawler.rate_limiter import RateLimiter
+from itg_crawler.retry import RetryStrategy
 from itg_crawler.robots_parser import RobotsParser
 from itg_crawler.semaphore_manager import SemaphoreManager
 
@@ -25,6 +36,10 @@ class AsyncCrawler:
         jitter: float = 0.0,
         user_agent: str = "AsyncCrawler/1.0",
         user_agents: list[str] | None = None,
+        connect_timeout: float = 10.0,
+        read_timeout: float = 10.0,
+        retry_strategy: RetryStrategy | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -44,8 +59,19 @@ class AsyncCrawler:
             jitter=jitter,
         )
         self.robots_parser = RobotsParser()
+        self.retry_strategy = retry_strategy or RetryStrategy(
+            max_retries=3,
+            backoff_factor=2.0,
+            retry_on=[TransientError, NetworkError],
+            overrides={ServerError: {"max_retries": 1}},
+        )
+        self.circuit_breaker = circuit_breaker
         self._session: aiohttp.ClientSession | None = None
-        self._timeout = aiohttp.ClientTimeout(connect=10, sock_read=10)
+        self._connect_timeout = connect_timeout
+        self._read_timeout = read_timeout
+        self._timeout = aiohttp.ClientTimeout(
+            connect=connect_timeout, sock_read=read_timeout
+        )
 
     def _get_user_agent(self) -> str:
         if not self.user_agents:
@@ -65,8 +91,13 @@ class AsyncCrawler:
             "blocked_by_robots": self._blocked_count,
         }
 
+    def get_error_stats(self) -> dict:
+        stats = self.retry_strategy.get_stats()
+        if self.circuit_breaker is not None:
+            stats["circuit_breaker"] = self.circuit_breaker.get_stats()
+        return stats
+
     async def fetch_url(self, url: str) -> str:
-        session = await self._get_session()
         domain = urlparse(url).netloc
         user_agent = self._get_user_agent()
 
@@ -83,37 +114,93 @@ class AsyncCrawler:
             if crawl_delay > 0:
                 self.rate_limiter.set_domain_delay(domain, crawl_delay)
 
+        if self.circuit_breaker and not self.circuit_breaker.allow_request(
+            domain
+        ):
+            logger.warning("Circuit breaker open for domain: %s", domain)
+            return ""
+
+        attempt_state = {"count": 0}
+
+        async def attempt() -> str:
+            attempt_state["count"] += 1
+            multiplier = 1.0 + 0.5 * (attempt_state["count"] - 1)
+            return await self._fetch_once(
+                url, domain, user_agent, timeout_multiplier=multiplier
+            )
+
         logger.info("Fetching URL: %s", url)
+        try:
+            text = await self.retry_strategy.execute_with_retry(attempt)
+        except CrawlerError as error:
+            logger.error(
+                "Failed to fetch URL: %s (%s)", url, type(error).__name__
+            )
+            self.rate_limiter.record_failure(domain)
+            if self.circuit_breaker:
+                self.circuit_breaker.record_failure(domain)
+            return ""
+
+        self.rate_limiter.record_success(domain)
+        if self.circuit_breaker:
+            self.circuit_breaker.record_success(domain)
+        return text
+
+    async def _fetch_once(
+        self,
+        url: str,
+        domain: str,
+        user_agent: str,
+        timeout_multiplier: float = 1.0,
+    ) -> str:
+        session = await self._get_session()
+        timeout = None
+        if timeout_multiplier != 1.0:
+            timeout = aiohttp.ClientTimeout(
+                connect=self._connect_timeout * timeout_multiplier,
+                sock_read=self._read_timeout * timeout_multiplier,
+            )
+
         try:
             async with self.semaphore_manager.acquire(url):
                 await self.rate_limiter.acquire(domain=domain)
                 headers = {"User-Agent": user_agent}
-                async with session.get(url, headers=headers) as response:
+                async with session.get(
+                    url, headers=headers, timeout=timeout
+                ) as response:
                     response.raise_for_status()
                     text = await response.text()
                     logger.info(
                         "Fetched URL: %s with status %d", url, response.status
                     )
-                    self.rate_limiter.record_success(domain)
                     return text
         except aiohttp.ClientResponseError as client_response_error:
-            self.rate_limiter.record_failure(domain)
             logger.error(
                 "Failed to fetch URL: %s with status %d",
                 url,
                 client_response_error.status,
             )
-            return ""
-        except TimeoutError:
-            self.rate_limiter.record_failure(domain)
+            error = classify_http_status(client_response_error.status, url=url)
+            if isinstance(error, RateLimitedError):
+                headers_map = client_response_error.headers or {}
+                retry_after = headers_map.get("Retry-After")
+                if retry_after is not None:
+                    with suppress(ValueError):
+                        error.retry_after = float(retry_after)
+            raise error from client_response_error
+        except TimeoutError as timeout_error:
             logger.error("Timeout while fetching URL: %s", url)
-            return ""
+            raise TransientError(
+                f"Timeout while fetching {url}", url=url
+            ) from timeout_error
         except aiohttp.ClientError as client_error:
-            self.rate_limiter.record_failure(domain)
             logger.error(
                 "Failed to fetch URL: %s due to %s", url, client_error
             )
-            return ""
+            raise NetworkError(
+                f"Network error while fetching {url}: {client_error}",
+                url=url,
+            ) from client_error
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         tasks = [self.fetch_url(url) for url in urls]
@@ -213,9 +300,7 @@ class AsyncCrawler:
                     end_time = time.perf_counter() - start_time
                     stats = self.queue.get_stats()
                     rate = (
-                        stats["processed"] / end_time
-                        if end_time > 0
-                        else 0.0
+                        stats["processed"] / end_time if end_time > 0 else 0.0
                     )
                     logger.info(
                         "Processed: %d | Queued: %d | Failed: %d | "

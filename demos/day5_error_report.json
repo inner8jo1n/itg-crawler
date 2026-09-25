@@ -1,0 +1,19 @@
+{
+  "errors_by_type": {
+    "NotFoundError": 1,
+    "ForbiddenError": 1,
+    "ServerError": 2,
+    "ServiceUnavailableError": 4,
+    "RateLimitedError": 4
+  },
+  "total_errors": 12,
+  "successful_retries": 0,
+  "avg_retry_delay": 2.142857142857143,
+  "permanent_failures": [
+    "https://httpbin.org/status/404",
+    "https://httpbin.org/status/403",
+    "https://httpbin.org/status/500",
+    "https://httpbin.org/status/503",
+    "https://httpbin.org/status/429"
+  ]
+}
