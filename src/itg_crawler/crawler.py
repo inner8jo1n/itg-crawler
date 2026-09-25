@@ -143,74 +143,121 @@ class AsyncCrawler:
         exclude_patterns: list[str] | None = None,
     ) -> list[dict]:
         for url in start_urls:
-            self.queue.add_url(url, priority=0)
+            await self.queue.add_url(url, priority=0)
 
         results: list[dict] = []
         start_time = time.perf_counter()
 
+        pages_lock = asyncio.Lock()
+        pages_reserved = 0
+        pages_completed = 0
+        limit_drained = asyncio.Event()
+
+        async def reserve_page_slot() -> bool:
+            nonlocal pages_reserved
+            async with pages_lock:
+                if pages_reserved >= max_pages:
+                    return False
+                pages_reserved += 1
+                return True
+
+        async def mark_slot_complete() -> None:
+            nonlocal pages_completed
+            async with pages_lock:
+                pages_completed += 1
+                if (
+                    pages_reserved >= max_pages
+                    and pages_completed >= pages_reserved
+                ):
+                    limit_drained.set()
+
         async def worker() -> None:
-            while len(results) < max_pages:
+            while True:
+                if not await reserve_page_slot():
+                    return
+
                 url = await self.queue.get_next()
-                if url is None:
-                    break
+                try:
+                    result = await self.fetch_and_parse(url)
 
-                result = await self.fetch_and_parse(url)
+                    if result["title"] or result["text"] or result["links"]:
+                        self.queue.mark_processed(url, result)
+                        results.append(result)
 
-                if len(results) >= max_pages:
-                    break
+                        depth = self.queue.get_depth(url)
+                        if depth < self.max_depth:
+                            page_domain = urlparse(url).netloc
+                            for link in result["links"]:
+                                if (
+                                    same_domain_only
+                                    and urlparse(link).netloc != page_domain
+                                ):
+                                    continue
+                                if exclude_patterns and any(
+                                    pattern in link
+                                    for pattern in exclude_patterns
+                                ):
+                                    continue
+                                if include_patterns and not any(
+                                    pattern in link
+                                    for pattern in include_patterns
+                                ):
+                                    continue
 
-                if result["title"] or result["text"] or result["links"]:
-                    self.queue.mark_processed(url, result)
-                    results.append(result)
+                                await self.queue.add_url(
+                                    link, priority=0, depth=depth + 1
+                                )
+                    else:
+                        self.queue.mark_failed(url, "fetch or parse failed")
 
-                    depth = self.queue.get_depth(url)
-                    if depth < self.max_depth:
-                        page_domain = urlparse(url).netloc
-                        for link in result["links"]:
-                            if (
-                                same_domain_only
-                                and urlparse(link).netloc != page_domain
-                            ):
-                                continue
-                            if exclude_patterns and any(
-                                pattern in link for pattern in exclude_patterns
-                            ):
-                                continue
-                            if include_patterns and not any(
-                                pattern in link for pattern in include_patterns
-                            ):
-                                continue
-
-                            self.queue.add_url(
-                                link, priority=0, depth=depth + 1
-                            )
-                else:
-                    self.queue.mark_failed(url, "fetch or parse failed")
-
-                end_time = time.perf_counter() - start_time
-                stats = self.queue.get_stats()
-                rate = stats["processed"] / end_time if end_time > 0 else 0.0
-                logger.info(
-                    "Processed: %d | Queued: %d | Failed: %d | "
-                    "Rate: %.2f pages/sec",
-                    stats["processed"],
-                    stats["queued"],
-                    stats["failed"],
-                    rate,
-                )
-                rate_stats = self.get_rate_stats()
-                logger.info(
-                    "Requests/sec: %.2f | Avg delay: %.2fs | "
-                    "Blocked by robots: %d",
-                    rate_stats["requests_per_second"],
-                    rate_stats["avg_delay"],
-                    rate_stats["blocked_by_robots"],
-                )
+                    end_time = time.perf_counter() - start_time
+                    stats = self.queue.get_stats()
+                    rate = (
+                        stats["processed"] / end_time
+                        if end_time > 0
+                        else 0.0
+                    )
+                    logger.info(
+                        "Processed: %d | Queued: %d | Failed: %d | "
+                        "Rate: %.2f pages/sec",
+                        stats["processed"],
+                        stats["queued"],
+                        stats["failed"],
+                        rate,
+                    )
+                    rate_stats = self.get_rate_stats()
+                    logger.info(
+                        "Requests/sec: %.2f | Avg delay: %.2fs | "
+                        "Blocked by robots: %d",
+                        rate_stats["requests_per_second"],
+                        rate_stats["avg_delay"],
+                        rate_stats["blocked_by_robots"],
+                    )
+                finally:
+                    self.queue.task_done()
+                    await mark_slot_complete()
 
         workers = [
             asyncio.create_task(worker()) for _ in range(self.max_concurrent)
         ]
-        await asyncio.gather(*workers)
+
+        join_task = asyncio.create_task(self.queue.join())
+        limit_task = asyncio.create_task(limit_drained.wait())
+        await asyncio.wait(
+            {join_task, limit_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        join_task.cancel()
+        limit_task.cancel()
+        await asyncio.gather(join_task, limit_task, return_exceptions=True)
+
+        for w in workers:
+            w.cancel()
+        outcomes = await asyncio.gather(*workers, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                raise outcome
 
         return results
 
